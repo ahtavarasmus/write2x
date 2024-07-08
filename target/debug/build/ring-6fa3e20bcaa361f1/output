@@ -26,7 +26,7 @@ CFLAGS_aarch64_apple_darwin = None
 cargo:rerun-if-env-changed=HOST_CFLAGS
 HOST_CFLAGS = None
 cargo:rerun-if-env-changed=CFLAGS
-CFLAGS = Some(-I/opt/homebrew/Cellar/raylib/5.0/include -I/opt/homebrew/Cellar/raylib/5.0/include )
+CFLAGS = Some(-I/opt/homebrew/Cellar/raylib/5.0/include )
 cargo:rustc-link-lib=static=ring_core_0_17_8_
 OPT_LEVEL = Some(0)
 TARGET = Some(aarch64-apple-darwin)
@@ -54,7 +54,7 @@ CFLAGS_aarch64_apple_darwin = None
 cargo:rerun-if-env-changed=HOST_CFLAGS
 HOST_CFLAGS = None
 cargo:rerun-if-env-changed=CFLAGS
-CFLAGS = Some(-I/opt/homebrew/Cellar/raylib/5.0/include -I/opt/homebrew/Cellar/raylib/5.0/include )
+CFLAGS = Some(-I/opt/homebrew/Cellar/raylib/5.0/include )
 cargo:rustc-link-lib=static=ring_core_0_17_8_test
 cargo:rustc-link-search=native=/Users/ahtavarasmus/Developer/mysites/write2x/target/debug/build/ring-6fa3e20bcaa361f1/out
 cargo:rerun-if-changed=crypto/perlasm/x86_64-xlate.pl

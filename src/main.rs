@@ -98,6 +98,7 @@ fn make_x_token(state: &Arc<AppState>) -> Result<BasicClient, Box<dyn std::error
 async fn login(State(state): State<Arc<AppState>>) -> Redirect {
 
     let x_token = make_x_token(&state);
+
     let x = state.config.values.get("X_CLIENT_ID").unwrap();
     println!("{:?}",&x);
 
