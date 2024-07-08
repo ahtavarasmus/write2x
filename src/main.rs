@@ -4,8 +4,20 @@ use axum::{
     extract::{Query, State},
     response::{Redirect, Html},
 };
+use oauth2::{
+    basic::BasicClient, 
+    Scope, 
+    AuthUrl, 
+    ClientId, 
+    ClientSecret, 
+    PkceCodeChallenge,
+    RedirectUrl, 
+    TokenUrl, 
+    CsrfToken
+};
 use base64::{Engine as _, engine::general_purpose};
 use rand::{Rng, thread_rng};
+use std::any::type_name;
 use sha2::{Sha256, Digest};
 use regex::Regex;
 use axum::http::StatusCode;
@@ -65,32 +77,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/callback", get(callback))
         .with_state(state);
 
+    println!("{}", state.config.values.get("X_SCOPES"));
+
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     axum::serve(listener, app).await?;
 
     Ok(())
 }
 
+fn make_x_token(state: &Arc<AppState>) -> Result<BasicClient, Box<dyn std::error::Error>> {
+    BasicClient::new(
+        ClientId::new(state.config.values.get("X_CLIENT_ID").cloned().unwrap()),
+        Some(ClientSecret::new(state.config.values.get("X_CLIENT_SECRET").cloned().unwrap())),
+        AuthUrl::new("https://api.twitter.com/2/oauth2/authorize".to_string())?,
+        Some(TokenUrl::new("https://api.twitter.com/2/oauth2/token".to_string())?)
+    )
+    .set_redirect_uri(RedirectUrl::new("moi".to_string())?);
+}
+
 async fn login(State(state): State<Arc<AppState>>) -> Redirect {
+
+    let x_token = make_x_token(&state);
+    let x = state.config.values.get("X_CLIENT_ID").unwrap();
+    println!("{:?}",&x);
+
     let mut session = state.session.lock().await;
     session.insert("is_authenticated", true).unwrap();
 
-    // Create a code verifier
-    let mut rng = thread_rng();
-    let random_bytes: Vec<u8> = (0..30).map(|_| rng.gen()).collect();
-    let mut code_verifier = general_purpose::URL_SAFE_NO_PAD.encode(random_bytes);
-    let re = Regex::new(r"[^a-zA-Z0-9]+").unwrap();
-    code_verifier = re.replace_all(&code_verifier, "").to_string();
+    // Generate a PKCE challenge.
+    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-    println!("code verifier: {}", code_verifier);
-    // Create a code challenge
-    let mut hasher = Sha256::new();
-    hasher.update(code_verifier.as_bytes());
-    let code_challenge = hasher.finalize();
+    let (auth_url, csrf_token) = x_token
+        .authorize_url(CsrfToken::new_random)
+        .add_scope(Scope::new(state.config.values.get("X_SCOPES").cloned().to_string()))
 
-    let mut code_challenge = general_purpose::URL_SAFE_NO_PAD.encode(code_challenge);
-    code_challenge = code_challenge.trim_end_matches('=').to_string();
-    println!("code chanllenge: {}", code_challenge);
+    auth_url = "https://twitter.com/i/oauth2/authorize"
+
+    let (auth_url, csrf_token) = x_token
+        .authorize_url(CsrfToken::new_random)
+        // Set the desired scopes.
+        .add_scope(Scope::new("read".to_string()))
+
 
     println!("Logged in!");
     Redirect::to("/")

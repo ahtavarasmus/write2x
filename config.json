@@ -1,3 +1,6 @@
 {
-    "moi": "hei otto haha"
+    "X_CLIENT_ID": "xclientid",
+    "X_CLIENT_SECRET": "xclientsecret",
+    "X_REDIRECT_URL": "xredirecturl",
+    "X_SCOPES": "x_scopes"
 }
