@@ -42,7 +42,7 @@ pub struct Config {
 }
 
 async fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
-    let config_file_path = "./config.json";
+    let config_file_path = "/etc/write2x_config.json";
     let contents = fs::read_to_string(config_file_path).await?;
     let config: Config = from_str(&contents)?;
     Ok(config)
