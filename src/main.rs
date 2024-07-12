@@ -1,28 +1,20 @@
 use axum::{
-    routing::{get, post},
-    Router,
     extract::{Query, State},
-    response::{Redirect, Html},
+    routing::{get, post},
+    response::{IntoResponse, Redirect, Html},
+    Router,
 };
 use oauth2::{
-    basic::BasicClient, 
-    Scope, 
-    AuthUrl, 
-    ClientId, 
-    ClientSecret, 
-    PkceCodeChallenge,
-    RedirectUrl, 
-    TokenUrl, 
-    CsrfToken
+    AuthUrl, AuthorizationCode, ClientId, 
+    ClientSecret, CsrfToken, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, Scope, TokenUrl,
+    TokenResponse,
 };
-use base64::{Engine as _, engine::general_purpose};
-use rand::{Rng, thread_rng};
-use std::any::type_name;
-use sha2::{Sha256, Digest};
-use regex::Regex;
+use oauth2::basic::BasicClient;
+use oauth2::reqwest::async_http_client;
+
 use axum::http::StatusCode;
 use tokio::fs;
-
 
 use serde::{Deserialize, Serialize};
 
@@ -39,12 +31,9 @@ use std::sync::Arc;
 struct AppState {
     session: Mutex<Session>,
     config: Config,
+    oauth_client: BasicClient,
+    pkce_verifier: Mutex<Option<PkceCodeVerifier>>,
 }
-
-struct XToken {
-
-}
-
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Config {
@@ -64,20 +53,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config().await?;
     println!("Config: {:?}", config);
 
+    // Initialize the OAuth client
+    let client = BasicClient::new(
+            ClientId::new(config.values.get("X_CLIENT_ID").expect("X_CLIENT_ID not found in config").to_string()),
+            Some(ClientSecret::new(config.values.get("X_CLIENT_SECRET").expect("X_CLIENT_SECRET not found in config").to_string())),
+            AuthUrl::new("https://x.com/i/oauth2/authorize".to_string())?,
+            Some(TokenUrl::new("https://api.twitter.com/2/oauth2/token".to_string())?)
+        )
+        .set_redirect_uri(RedirectUrl::new(config.values.get("X_REDIRECT_URL").expect("X_REDIRECT_URL not found in config").to_string())?);
+
+
     let state = Arc::new(AppState {
         session: Mutex::new(Session::new()),
         config,
+        oauth_client: client,
+        pkce_verifier: Mutex::new(None),
     });
 
     let app = Router::new()
         .route("/", get(get_home))
-        .route("/x_auth", get(x_auth_user))
         .route("/login", post(login))
+        .route("/callback", get(callback_handler))
         .route("/logout", post(logout))
-        .route("/callback", get(callback))
         .with_state(state);
-
-    println!("{}", state.config.values.get("X_SCOPES"));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     axum::serve(listener, app).await?;
@@ -85,51 +83,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn make_x_token(state: &Arc<AppState>) -> Result<BasicClient, Box<dyn std::error::Error>> {
-    BasicClient::new(
-        ClientId::new(state.config.values.get("X_CLIENT_ID").cloned().unwrap()),
-        Some(ClientSecret::new(state.config.values.get("X_CLIENT_SECRET").cloned().unwrap())),
-        AuthUrl::new("https://api.twitter.com/2/oauth2/authorize".to_string())?,
-        Some(TokenUrl::new("https://api.twitter.com/2/oauth2/token".to_string())?)
-    )
-    .set_redirect_uri(RedirectUrl::new("moi".to_string())?);
-}
 
-async fn login(State(state): State<Arc<AppState>>) -> Redirect {
+async fn login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
-    let x_token = make_x_token(&state);
-
-    let x = state.config.values.get("X_CLIENT_ID").unwrap();
-    println!("{:?}",&x);
-
-    let mut session = state.session.lock().await;
-    session.insert("is_authenticated", true).unwrap();
-
-    // Generate a PKCE challenge.
+    // Generate a PKCE challenge
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-    let (auth_url, csrf_token) = x_token
+    // Store the PKCE verifier for later use
+    *state.pkce_verifier.lock().await = Some(pkce_verifier);
+
+    // Generate the authorization URL
+    let (auth_url, _csrf_token) = state.oauth_client
         .authorize_url(CsrfToken::new_random)
-        .add_scope(Scope::new(state.config.values.get("X_SCOPES").cloned().to_string()))
-
-    auth_url = "https://twitter.com/i/oauth2/authorize"
-
-    let (auth_url, csrf_token) = x_token
-        .authorize_url(CsrfToken::new_random)
-        // Set the desired scopes.
-        .add_scope(Scope::new("read".to_string()))
-
-
-    println!("Logged in!");
-    Redirect::to("/")
+        .add_scope(Scope::new("tweet.read".to_string()))
+        .add_scope(Scope::new("tweet.write".to_string()))
+        .add_scope(Scope::new("users.read".to_string()))
+        .add_scope(Scope::new("offline.access".to_string()))
+        .set_pkce_challenge(pkce_challenge)
+        .url();
+    Redirect::to(auth_url.as_str())
 }
 
+//https://x.com/2/oauth2/authorize?response_type=code&client_id=RWc2eUxUR19qSmhHY3piTjJ4aXQ6MTpjaQ&state=8am17CZxm3EslgiEmVuHBg&code_challenge=m_atn1LH5gaifPIOM9fcoUcUbE85XwTzTNERXrQ1cEA&code_challenge_method=S256&redirect_uri=https%3A%2F%2Fpacepeek.ngrok.app%2Fcallback&scope=tweet.read+tweet.write+users.read+offline.access
+
+// https://twitter.com/i/oauth2/authorize?response_type=code&client_id=M1M5R3BMVy13QmpScXkzTUt5OE46MTpjaQ&redirect_uri=https://www.example.com&scope=tweet.read%20users.read%20offline.access&state=state&code_challenge=challenge&code_challenge_method=plain
+
+async fn callback_handler(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> Redirect {
+    if let Some(error) = params.get("error") {
+        println!("Error in OAuth callback: {}", error);
+        if error == "access_denied" {
+            println!("Access denied by user");
+        }
+        return Redirect::to("/");
+    }
+    let code = params.get("code").expect("No code in params");
+
+    // Retrieve the PKCE verifier
+    let verifier = state.pkce_verifier.lock().await.take().expect("No PKCE verifier found");
+
+    // Exchange the code for a token
+    let token_result = state.oauth_client
+        .exchange_code(AuthorizationCode::new(code.to_string()))
+        .set_pkce_verifier(verifier)
+        .request_async(async_http_client)
+        .await;
+
+    match token_result {
+        Ok(token) => {
+            // Here you would typically store the token securely and use it for API requests
+            let mut session = state.session.lock().await;
+            session.insert("is_authenticated", true).unwrap();
+            println!("Successfully authenticated! Access token: {}", token.access_token().secret());
+            session.insert("access_token", token.access_token().secret()).unwrap();
+            println!("Refresh token: {}", token.refresh_token().unwrap().secret());
+            session.insert("refresh_token", token.refresh_token().unwrap().secret()).unwrap();
+            Redirect::to("/")
+        }
+        Err(e) => {
+            println!("Failed to authenticate: {:?}", e);
+            Redirect::to("/")
+        }
+    }
+}
 
 async fn logout(State(state): State<Arc<AppState>>) -> Redirect {
     let mut session = state.session.lock().await;
     
     // Remove authentication status
     let _ = session.remove("is_authenticated");
+    let _ = session.remove("access_token");
+    let _ = session.remove("refresh_token");
     // Or to clear entire session: session.clear();
     
     println!("Logged out!");
@@ -182,27 +208,3 @@ async fn get_home(State(state): State<Arc<AppState>>) -> Result<Html<String>, St
     Ok(Html(html))
 }
 
-async fn x_auth_user(State(state): State<Arc<AppState>>) -> Result<Redirect, StatusCode> {
-    let x_token = make_x_token(&state.config);
-    // Implement the rest of the x_auth_user logic here
-    // ...
-
-    Ok(Redirect::to("/callback")) // Replace with actual redirect URL
-}
-
-async fn callback(
-    Query(params): Query<std::collections::HashMap<String, String>>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Redirect, StatusCode> {
-    let code = params.get("code").ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
-    // Implement the rest of the callback logic here
-    // ...
-
-    Ok(Redirect::to("/")) // Redirect to home after successful auth
-}
-
-// Implement this function
-fn make_x_token(config: &Config) -> XToken {
-    // ...
-    XToken {}
-}
