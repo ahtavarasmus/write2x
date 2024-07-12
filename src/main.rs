@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State},
+    extract::{Query, State, Form},
     routing::{get, post},
     response::{IntoResponse, Redirect, Html},
     Router,
@@ -11,6 +11,7 @@ use oauth2::{
     TokenResponse,
 };
 use oauth2::basic::BasicClient;
+use reqwest::{Client, header};
 use oauth2::reqwest::async_http_client;
 
 use axum::http::StatusCode;
@@ -18,7 +19,7 @@ use tokio::fs;
 
 use serde::{Deserialize, Serialize};
 
-use serde_json::from_str;
+use serde_json::{json, from_str};
 
 
 use tokio::sync::Mutex;
@@ -72,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/", get(get_home))
+        .route("/post_home", post(post_home))
         .route("/login", post(login))
         .route("/callback", get(callback_handler))
         .route("/logout", post(logout))
@@ -82,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
 
 
 async fn login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -164,6 +167,65 @@ async fn logout(State(state): State<Arc<AppState>>) -> Redirect {
     Redirect::to("/")
 }
 
+
+async fn post_to_x(content: &str, access_token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Posting to X");
+    let client = Client::new();
+    let response = client
+        .post("https://api.twitter.com/2/tweets")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "text": content
+        }))
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        println!("Successfully posted to X");
+        Ok(())
+    } else {
+        println!("Failed to post to X: {}", response.status());
+        Err(format!("X API error: {}", response.status()).into())
+    }
+}
+
+
+#[derive(Deserialize)]
+struct PostForm {
+    content: String,
+}
+
+async fn post_home(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    Form(form): Form<PostForm>
+) -> Result<Redirect, (StatusCode, Html<String>)> {
+    let mut session = state.session.lock().await;
+    let is_authenticated = session.get::<bool>("is_authenticated").unwrap_or(false);
+     
+    if is_authenticated {
+        println!("is_authenticated");
+        // User is authenticated, post to X
+        match post_to_x(&form.content, &session.get::<String>("access_token").unwrap_or_default()).await {
+            Ok(_) => {
+                println!("Successfully posted to X");
+                Ok(Redirect::to("/")) // Redirect to home on success
+            },
+            Err(e) => {
+                eprintln!("Error posting to X: {}", e);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Html(format!("<h1>Error posting to X</h1><p>{}</p>", e))))
+            }
+        }
+    } else {
+        // User is not authenticated, redirect to home
+        println!("User not authenticated");
+        Ok(Redirect::to("/"))
+    }
+
+}
+
+
 async fn get_home(State(state): State<Arc<AppState>>) -> Result<Html<String>, StatusCode> {
     let mut session = state.session.lock().await;
     let is_authenticated = session.get::<bool>("is_authenticated").unwrap_or(false);
@@ -173,6 +235,14 @@ async fn get_home(State(state): State<Arc<AppState>>) -> Result<Html<String>, St
         format!(
             r#"
             <h1>Hey, authenticated user!</h1>
+            <form action="/post_home" method="post">
+                <textarea name="content" cols="30" rows="10"></textarea>
+                <br>
+                <input type="submit" value="Post">
+            </form>
+            <br>
+            <br>
+            <br>
             <form action="/logout" method="post">
                 <button type="submit">Logout</button>
             </form>
