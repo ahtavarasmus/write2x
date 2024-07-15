@@ -11,7 +11,10 @@ use oauth2::{
     TokenResponse,
 };
 use oauth2::basic::BasicClient;
-use reqwest::{Client, header};
+use reqwest::Client;
+use reqwest::header::{
+    HeaderMap, HeaderValue, AUTHORIZATION
+};
 use oauth2::reqwest::async_http_client;
 
 use axum::http::StatusCode;
@@ -19,7 +22,7 @@ use tokio::fs;
 
 use serde::{Deserialize, Serialize};
 
-use serde_json::{json, from_str};
+use serde_json::{json, from_str, Value};
 
 
 use tokio::sync::Mutex;
@@ -107,9 +110,6 @@ async fn login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Redirect::to(auth_url.as_str())
 }
 
-//https://x.com/2/oauth2/authorize?response_type=code&client_id=RWc2eUxUR19qSmhHY3piTjJ4aXQ6MTpjaQ&state=8am17CZxm3EslgiEmVuHBg&code_challenge=m_atn1LH5gaifPIOM9fcoUcUbE85XwTzTNERXrQ1cEA&code_challenge_method=S256&redirect_uri=https%3A%2F%2Fpacepeek.ngrok.app%2Fcallback&scope=tweet.read+tweet.write+users.read+offline.access
-
-// https://twitter.com/i/oauth2/authorize?response_type=code&client_id=M1M5R3BMVy13QmpScXkzTUt5OE46MTpjaQ&redirect_uri=https://www.example.com&scope=tweet.read%20users.read%20offline.access&state=state&code_challenge=challenge&code_challenge_method=plain
 
 async fn callback_handler(
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -139,10 +139,49 @@ async fn callback_handler(
             // Here you would typically store the token securely and use it for API requests
             let mut session = state.session.lock().await;
             session.insert("is_authenticated", true).unwrap();
-            println!("Successfully authenticated! Access token: {}", token.access_token().secret());
-            session.insert("access_token", token.access_token().secret()).unwrap();
-            println!("Refresh token: {}", token.refresh_token().unwrap().secret());
-            session.insert("refresh_token", token.refresh_token().unwrap().secret()).unwrap();
+            let access_token = token.access_token().secret();
+            let refresh_token = token.refresh_token().unwrap().secret();
+            println!("Successfully authenticated! Access token: {}", access_token);
+            println!("Refresh token: {}", refresh_token);
+            session.insert("access_token", access_token).unwrap(); 
+            session.insert("refresh_token", refresh_token).unwrap();
+
+            // Create a client
+            let client = reqwest::Client::new();
+
+            // Create headers
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", &access_token)).unwrap());
+
+            match client.get("https://api.twitter.com/2/users/me")
+                .headers(headers)
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        match response.json::<Value>().await {
+                        Ok(json) => {
+                            println!("Twitter API Response: {:?}", json);
+                            if let Some(id) = json.get("data").and_then(|data| data.get("id")) {
+                                println!("User ID: {}", id);
+                            }
+                            if let Some(username) = json.get("data").and_then(|data| data.get("username")) {
+                                println!("Username: {}", username);
+                                session.insert("username", username).unwrap();
+                            }
+                        },
+                        Err(e) => println!("Failed to parse JSON: {:?}", e),
+                    }
+                    } else {
+                        println!("Twitter API request failed with status: {:?}", response.status());
+                    }
+
+                },
+                Err(e) => println!("Failed to send request to Twitter API: {:?}", e),
+
+            }
+
             Redirect::to("/")
         }
         Err(e) => {
@@ -155,11 +194,10 @@ async fn callback_handler(
 async fn logout(State(state): State<Arc<AppState>>) -> Redirect {
     let mut session = state.session.lock().await;
     
-    // Remove authentication status
     let _ = session.remove("is_authenticated");
     let _ = session.remove("access_token");
     let _ = session.remove("refresh_token");
-    // Or to clear entire session: session.clear();
+    let _ = session.remove("username");
     
     println!("Logged out!");
     
@@ -201,7 +239,7 @@ async fn post_home(
     Query(params): Query<std::collections::HashMap<String, String>>,
     Form(form): Form<PostForm>
 ) -> Result<Redirect, (StatusCode, Html<String>)> {
-    let mut session = state.session.lock().await;
+    let session = state.session.lock().await;
     let is_authenticated = session.get::<bool>("is_authenticated").unwrap_or(false);
      
     if is_authenticated {
@@ -227,14 +265,15 @@ async fn post_home(
 
 
 async fn get_home(State(state): State<Arc<AppState>>) -> Result<Html<String>, StatusCode> {
-    let mut session = state.session.lock().await;
+    let session = state.session.lock().await;
     let is_authenticated = session.get::<bool>("is_authenticated").unwrap_or(false);
+    let username = session.get::<String>("username").unwrap_or("unknown user".to_string());
 
     let body = if is_authenticated {
-        println!("Authenticated user");
+        println!("Authenticated user {}", &username);
         format!(
             r#"
-            <h1>Hey, authenticated user!</h1>
+            <h1>Hey, {}!</h1>
             <form action="/post_home" method="post">
                 <textarea name="content" cols="30" rows="10"></textarea>
                 <br>
@@ -244,17 +283,18 @@ async fn get_home(State(state): State<Arc<AppState>>) -> Result<Html<String>, St
             <br>
             <br>
             <form action="/logout" method="post">
-                <button type="submit">Logout</button>
+                <button type="submit">Disconnect</button>
             </form>
-            "#
+            "#,
+            &username
         )
     } else {
         println!("Unauthenticated user");
         format!(
             r#"
-            <h1>Welcome to the landing page!</h1>
+            <h1>Welcome to Write2X! Here you can post to X platform. Yes that's all. Why? Because now you can post that great thought without getting lost in the algorithms. Your access token is stored in your browser, so you don't have to trust us with it. Code is on github so you can check how this works if you want.</h1>
             <form action="/login" method="post">
-                <button type="submit">Login</button>
+                <button type="submit">Connect to 𝕏</button>
             </form>
             "#
         )
@@ -266,7 +306,7 @@ async fn get_home(State(state): State<Arc<AppState>>) -> Result<Html<String>, St
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Home Page</title>
+            <title>Write2X</title>
         </head>
         <body>
             {}
