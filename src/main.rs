@@ -5,17 +5,20 @@ use axum::{
     Router,
 };
 use oauth2::{
+    StandardTokenResponse, EmptyExtraTokenFields, basic::BasicTokenType,
     AuthUrl, AuthorizationCode, ClientId, 
     ClientSecret, CsrfToken, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, Scope, TokenUrl,
     TokenResponse,
 };
+use std::time::{SystemTime, Duration};
 use oauth2::basic::BasicClient;
 use reqwest::Client;
 use reqwest::header::{
     HeaderMap, HeaderValue, AUTHORIZATION
 };
 use oauth2::reqwest::async_http_client;
+use base64::encode;
 
 use axum::http::StatusCode;
 use tokio::fs;
@@ -37,6 +40,45 @@ struct AppState {
     config: Config,
     oauth_client: BasicClient,
     pkce_verifier: Mutex<Option<PkceCodeVerifier>>,
+}
+
+impl AppState {
+    pub async fn refresh_access_token(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let session = self.session.lock().await;
+        let access_token = session.get::<String>("access_token").unwrap_or_default();
+        let refresh_token = session.get::<String>("refresh_token").unwrap_or_default();
+        let expiration_time = session.get::<SystemTime>("access_token_expiration_time").unwrap_or(SystemTime::UNIX_EPOCH);
+
+        let url = "https://api.twitter.com/2/oauth2/token";
+    
+        let client = Client::new();
+
+        let basic_auth_str = format!("{}:{}", self.config.values.get("X_CLIENT_ID").expect("Couldn't retrieve X_CLIENT_ID when refreshing token").to_string(), self.config.values.get("X_CLIENT_SECRET").expect("Couldn't retrieve X_CLIENT_SECRET when refreshing token").to_string());
+        let basic_auth_encoded = encode(basic_auth_str);
+
+        let response = client.post(url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Authorization", format!("Basic {}", basic_auth_encoded))
+            .form(&[
+                ("refresh_token", refresh_token),
+                ("grant_type", "refresh_token".to_string()),
+            ])
+            .send()
+            .await?;
+
+        let new_tokens: StandardTokenResponse<EmptyExtraTokenFields, BasicTokenType> = response.json().await?;
+
+        let new_access_token = new_tokens.access_token().secret();
+        let new_refresh_token = new_tokens.refresh_token().unwrap().secret();
+        let new_expires_in = new_tokens.expires_in().unwrap();
+        let new_expiration_time = SystemTime::now() + Duration::from_secs(new_expires_in as u64);
+
+        session.insert("access_token", new_access_token).unwrap();
+        session.insert("refresh_token", new_refresh_token).unwrap();
+        session.insert("access_token_expiration_time", new_expiration_time).unwrap();
+        println!("Refreshed access token");
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -86,6 +128,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+
+async fn refresh_access_token(session: &Session) {
+async fn refresh_access_token_from_x(session: &Session) -> Result<(), Box<dyn Error>> {
+    let url = "https://api.twitter.com/2/oauth2/token";
+    
+    let client = Client::new();
+
+    let basic_auth_str = format!("{}:{}", config::get("X_CLIENT_ID"), config::get("X_CLIENT_SECRET"));
+    let basic_auth_encoded = encode(basic_auth_str);
+
+    let response = client.post(url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Authorization", format!("Basic {}", basic_auth_encoded))
+        .form(&[
+            ("refresh_token", &user.x_refresh_token_decrypted),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .await?;
+
+    let new_tokens: Value = response.json().await?;
+
+    user.x_access_token_decrypted = new_tokens["access_token"].as_str().unwrap().to_string();
+    user.x_access_token_exists = true;
+    user.x_refresh_token_decrypted = new_tokens["refresh_token"].as_str().unwrap().to_string();
+    
+    let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as f64;
+    user.x_access_token_expires_at_timestamp = current_time + new_tokens["expires_in"].as_f64().unwrap();
+
+    Ok(())
+}
+
+}
+
+async fn token_needs_refresh(state: &State<Arc<AppState>>) -> bool {
+    let current_time = SystemTime::now();
+    current_time < state.session.lock().await.get::<SystemTime>("expiration_time").unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 
@@ -141,10 +222,13 @@ async fn callback_handler(
             session.insert("is_authenticated", true).unwrap();
             let access_token = token.access_token().secret();
             let refresh_token = token.refresh_token().unwrap().secret();
-            println!("Successfully authenticated! Access token: {}", access_token);
-            println!("Refresh token: {}", refresh_token);
+            let token_creation_time = SystemTime::now();
+            let expires_in = token.expires_in().unwrap();
+            let expiration_time = token_creation_time + Duration::from_secs(expires_in as u64);
+            println!("Successfully authenticated!");
             session.insert("access_token", access_token).unwrap(); 
             session.insert("refresh_token", refresh_token).unwrap();
+            session.insert("access_token_expiration_time", expiration_time).unwrap();
 
             // Create a client
             let client = reqwest::Client::new();
@@ -198,6 +282,7 @@ async fn logout(State(state): State<Arc<AppState>>) -> Redirect {
     let _ = session.remove("access_token");
     let _ = session.remove("refresh_token");
     let _ = session.remove("username");
+    let _ = session.remove("access_token_expiration_time");
     
     println!("Logged out!");
     
