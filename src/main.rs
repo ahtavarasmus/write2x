@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/logout", post(logout))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -238,7 +238,7 @@ async fn post_home(
     State(state): State<Arc<AppState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
     Form(form): Form<PostForm>
-) -> Result<Redirect, (StatusCode, Html<String>)> {
+) -> Result<Html<String>, (StatusCode, Html<String>)> {
     let session = state.session.lock().await;
     let is_authenticated = session.get::<bool>("is_authenticated").unwrap_or(false);
      
@@ -248,17 +248,17 @@ async fn post_home(
         match post_to_x(&form.content, &session.get::<String>("access_token").unwrap_or_default()).await {
             Ok(_) => {
                 println!("Successfully posted to X");
-                Ok(Redirect::to("/")) // Redirect to home on success
+                Ok(Html(format!("<h1>Successfully posted to X!</h1><p>This is what was posted: '{}'</p><a href='/'>Return to home</a>",&form.content)))
             },
             Err(e) => {
                 eprintln!("Error posting to X: {}", e);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Html(format!("<h1>Error posting to X</h1><p>{}</p>", e))))
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Html(format!("<h1>Error posting to X</h1><p>{}</p><a href='/'>Return to home</a>", e))))
             }
         }
     } else {
         // User is not authenticated, redirect to home
         println!("User not authenticated");
-        Ok(Redirect::to("/"))
+        Err((StatusCode::UNAUTHORIZED, Html("<h1>Unauthorized</h1><a href='/'>Return to home</a>".to_string())))
     }
 
 }
@@ -292,7 +292,8 @@ async fn get_home(State(state): State<Arc<AppState>>) -> Result<Html<String>, St
         println!("Unauthenticated user");
         format!(
             r#"
-            <h1>Welcome to Write2X! Here you can post to X platform. Yes that's all. Why? Because now you can post that great thought without getting lost in the algorithms. Your access token is stored in your browser, so you don't have to trust us with it. Code is on github so you can check how this works if you want.</h1>
+            <h1>Welcome to Write2X!</h1> 
+            <p>Here you can post to 𝕏 platform. Yes that's all. Why? Because now you can post that great thought without getting lost in the algorithms. Your access token will be stored in your browser, so you don't have to trust us with it. Code is on <a href="https://github.com/ahtavarasmus/write2x" target="_blank">github</a> so you can check how this works if you want.</p>
             <form action="/login" method="post">
                 <button type="submit">Connect to 𝕏</button>
             </form>
