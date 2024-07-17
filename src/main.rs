@@ -11,6 +11,7 @@ use oauth2::{
     PkceCodeVerifier, RedirectUrl, Scope, TokenUrl,
     TokenResponse,
 };
+use tower_sessions::{Session, SessionManagerLayer, Expiry, MemoryStore};
 use std::time::{SystemTime, Duration};
 use oauth2::basic::BasicClient;
 use reqwest::Client;
@@ -36,7 +37,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 struct AppState {
-    session: Mutex<Session>,
     config: Config,
     oauth_client: BasicClient,
     pkce_verifier: Mutex<Option<PkceCodeVerifier>>,
@@ -110,11 +110,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
     let state = Arc::new(AppState {
-        session: Mutex::new(Session::new()),
         config,
         oauth_client: client,
         pkce_verifier: Mutex::new(None),
     });
+
+    // Create a session store
+    let session_store = MemoryStore::default();
+    
+    // Create the session layer
+    let session_layer = SessionManagerLayer::new(session_store)
+        .with_secure(false)
+        .with_expiry(Expiry::OnInactivity(Duration::hours(1)));
+
 
     let app = Router::new()
         .route("/", get(get_home))
@@ -122,7 +130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/login", post(login))
         .route("/callback", get(callback_handler))
         .route("/logout", post(logout))
+        .layer(session_layer)
         .with_state(state);
+        
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     axum::serve(listener, app).await?;
@@ -164,20 +174,20 @@ async fn refresh_access_token_from_x(session: &Session) -> Result<(), Box<dyn Er
 
 }
 
-async fn token_needs_refresh(state: &State<Arc<AppState>>) -> bool {
+async fn token_needs_refresh(session: Session) -> bool {
     let current_time = SystemTime::now();
     current_time < state.session.lock().await.get::<SystemTime>("expiration_time").unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 
 
-async fn login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn login(mut session: Session, State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     // Generate a PKCE challenge
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
     // Store the PKCE verifier for later use
-    *state.pkce_verifier.lock().await = Some(pkce_verifier);
+    session.insert("pkce_verifier", pkce_verifier.secret()).await?;
 
     // Generate the authorization URL
     let (auth_url, _csrf_token) = state.oauth_client
@@ -188,6 +198,7 @@ async fn login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .add_scope(Scope::new("offline.access".to_string()))
         .set_pkce_challenge(pkce_challenge)
         .url();
+    session.insert("_csrf_token", _csrf_token.secret()).await?;
     Redirect::to(auth_url.as_str())
 }
 
@@ -195,6 +206,7 @@ async fn login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 async fn callback_handler(
     Query(params): Query<std::collections::HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
+    session: Session
 ) -> Redirect {
     if let Some(error) = params.get("error") {
         println!("Error in OAuth callback: {}", error);
@@ -206,7 +218,7 @@ async fn callback_handler(
     let code = params.get("code").expect("No code in params");
 
     // Retrieve the PKCE verifier
-    let verifier = state.pkce_verifier.lock().await.take().expect("No PKCE verifier found");
+    let verifier = session.get("pkce_verifier").expect("No PKCE verifier found").await?;
 
     // Exchange the code for a token
     let token_result = state.oauth_client
