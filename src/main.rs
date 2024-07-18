@@ -1,7 +1,8 @@
 use axum::{
+    http::StatusCode,
     extract::{Query, State, Form},
     routing::{get, post},
-    response::{IntoResponse, Redirect, Html},
+    response::{IntoResponse, Redirect, Html, Response},
     Router,
 };
 use oauth2::{
@@ -10,18 +11,15 @@ use oauth2::{
     ClientSecret, CsrfToken, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, Scope, TokenUrl,
     TokenResponse,
+    basic::BasicClient,
+    reqwest::async_http_client
 };
 use tower_sessions::{Session, SessionManagerLayer, Expiry, MemoryStore};
 use std::time::{SystemTime, Duration};
-use oauth2::basic::BasicClient;
-use reqwest::Client;
-use reqwest::header::{
-    HeaderMap, HeaderValue, AUTHORIZATION
+use reqwest::{Client,header::{HeaderMap, HeaderValue, AUTHORIZATION}
 };
-use oauth2::reqwest::async_http_client;
 use base64::encode;
 
-use axum::http::StatusCode;
 use tokio::fs;
 
 use serde::{Deserialize, Serialize};
@@ -31,10 +29,34 @@ use serde_json::{json, from_str, Value};
 
 use tokio::sync::Mutex;
 
-use async_session::Session;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+
+#[derive(Debug)]
+pub struct AppError(pub anyhow::Error);
+
+// Tell axum how to convert `AppError` into a response.
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Something went wrong: {}", self.0),
+        )
+            .into_response()
+    }
+}
+
+impl<E> From<E> for AppError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        Self(err.into())
+    }
+}
+
 
 struct AppState {
     config: Config,
@@ -44,7 +66,6 @@ struct AppState {
 
 impl AppState {
     pub async fn refresh_access_token(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let session = self.session.lock().await;
         let access_token = session.get::<String>("access_token").unwrap_or_default();
         let refresh_token = session.get::<String>("refresh_token").unwrap_or_default();
         let expiration_time = session.get::<SystemTime>("access_token_expiration_time").unwrap_or(SystemTime::UNIX_EPOCH);
@@ -120,8 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Create the session layer
     let session_layer = SessionManagerLayer::new(session_store)
-        .with_secure(false)
-        .with_expiry(Expiry::OnInactivity(Duration::hours(1)));
+        .with_secure(false);
 
 
     let app = Router::new()
@@ -140,48 +160,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-
-async fn refresh_access_token(session: &Session) {
-async fn refresh_access_token_from_x(session: &Session) -> Result<(), Box<dyn Error>> {
-    let url = "https://api.twitter.com/2/oauth2/token";
-    
-    let client = Client::new();
-
-    let basic_auth_str = format!("{}:{}", config::get("X_CLIENT_ID"), config::get("X_CLIENT_SECRET"));
-    let basic_auth_encoded = encode(basic_auth_str);
-
-    let response = client.post(url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Authorization", format!("Basic {}", basic_auth_encoded))
-        .form(&[
-            ("refresh_token", &user.x_refresh_token_decrypted),
-            ("grant_type", "refresh_token"),
-        ])
-        .send()
-        .await?;
-
-    let new_tokens: Value = response.json().await?;
-
-    user.x_access_token_decrypted = new_tokens["access_token"].as_str().unwrap().to_string();
-    user.x_access_token_exists = true;
-    user.x_refresh_token_decrypted = new_tokens["refresh_token"].as_str().unwrap().to_string();
-    
-    let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as f64;
-    user.x_access_token_expires_at_timestamp = current_time + new_tokens["expires_in"].as_f64().unwrap();
-
-    Ok(())
-}
-
-}
-
 async fn token_needs_refresh(session: Session) -> bool {
     let current_time = SystemTime::now();
-    current_time < state.session.lock().await.get::<SystemTime>("expiration_time").unwrap_or(SystemTime::UNIX_EPOCH)
+    current_time < session.await.get::<SystemTime>("expiration_time").unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 
-
-async fn login(mut session: Session, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn login(
+        session: Session, 
+        State(state): State<Arc<AppState>>
+    ) -> Result<Redirect, AppError> {
 
     // Generate a PKCE challenge
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
@@ -199,26 +187,27 @@ async fn login(mut session: Session, State(state): State<Arc<AppState>>) -> impl
         .set_pkce_challenge(pkce_challenge)
         .url();
     session.insert("_csrf_token", _csrf_token.secret()).await?;
-    Redirect::to(auth_url.as_str())
+    Ok(Redirect::to(auth_url.as_str()))
 }
 
 
 async fn callback_handler(
     Query(params): Query<std::collections::HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
-    session: Session
-) -> Redirect {
+    mut session: Session
+) -> Result<Redirect, AppError> {
     if let Some(error) = params.get("error") {
         println!("Error in OAuth callback: {}", error);
         if error == "access_denied" {
             println!("Access denied by user");
         }
-        return Redirect::to("/");
+        return Ok(Redirect::to("/"))
     }
     let code = params.get("code").expect("No code in params");
 
     // Retrieve the PKCE verifier
-    let verifier = session.get("pkce_verifier").expect("No PKCE verifier found").await?;
+    let verifier = session.get("pkce_verifier").await?
+            .ok_or_else(|| AppError(anyhow::anyhow!("PKCE verifier not found in session")))?;
 
     // Exchange the code for a token
     let token_result = state.oauth_client
@@ -229,18 +218,16 @@ async fn callback_handler(
 
     match token_result {
         Ok(token) => {
-            // Here you would typically store the token securely and use it for API requests
-            let mut session = state.session.lock().await;
-            session.insert("is_authenticated", true).unwrap();
+            session.insert("is_authenticated", true).await?;
             let access_token = token.access_token().secret();
             let refresh_token = token.refresh_token().unwrap().secret();
             let token_creation_time = SystemTime::now();
-            let expires_in = token.expires_in().unwrap();
-            let expiration_time = token_creation_time + Duration::from_secs(expires_in as u64);
+            let expires_in = token.expires_in().unwrap_or(Duration::from_secs(3600));
+            let expiration_time = token_creation_time + Duration::from_secs(expires_in.as_secs());
             println!("Successfully authenticated!");
-            session.insert("access_token", access_token).unwrap(); 
-            session.insert("refresh_token", refresh_token).unwrap();
-            session.insert("access_token_expiration_time", expiration_time).unwrap();
+            session.insert("access_token", access_token).await?;
+            session.insert("refresh_token", refresh_token).await?;
+            session.insert("access_token_expiration_time", expiration_time).await?;
 
             // Create a client
             let client = reqwest::Client::new();
@@ -264,7 +251,7 @@ async fn callback_handler(
                             }
                             if let Some(username) = json.get("data").and_then(|data| data.get("username")) {
                                 println!("Username: {}", username);
-                                session.insert("username", username).unwrap();
+                                session.insert("username", username).await?;
                             }
                         },
                         Err(e) => println!("Failed to parse JSON: {:?}", e),
@@ -278,23 +265,18 @@ async fn callback_handler(
 
             }
 
-            Redirect::to("/")
+            Ok(Redirect::to("/"))
         }
         Err(e) => {
             println!("Failed to authenticate: {:?}", e);
-            Redirect::to("/")
+            Ok(Redirect::to("/"))
         }
     }
 }
 
-async fn logout(State(state): State<Arc<AppState>>) -> Redirect {
-    let mut session = state.session.lock().await;
+async fn logout(State(state): State<Arc<AppState>>, mut session: Session) -> impl IntoResponse {
     
-    let _ = session.remove("is_authenticated");
-    let _ = session.remove("access_token");
-    let _ = session.remove("refresh_token");
-    let _ = session.remove("username");
-    let _ = session.remove("access_token_expiration_time");
+    session.clear().await;
     
     println!("Logged out!");
     
@@ -303,9 +285,12 @@ async fn logout(State(state): State<Arc<AppState>>) -> Redirect {
 }
 
 
-async fn post_to_x(content: &str, access_token: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn post_to_x(content: &str, session: Session) -> Result<(), AppError> {
     println!("Posting to X");
     let client = Client::new();
+    let access_token: Option<String> = session.get::<String>("access_token").await
+        .unwrap_or(None)
+        .unwrap_or_else(|| String::new());
     let response = client
         .post("https://api.twitter.com/2/tweets")
         .header("Authorization", format!("Bearer {}", access_token))
@@ -321,7 +306,7 @@ async fn post_to_x(content: &str, access_token: &str) -> Result<(), Box<dyn std:
         Ok(())
     } else {
         println!("Failed to post to X: {}", response.status());
-        Err(format!("X API error: {}", response.status()).into())
+        Err(AppError(anyhow::anyhow!("Failed to post to X: {}", response.status())))
     }
 }
 
@@ -334,35 +319,45 @@ struct PostForm {
 async fn post_home(
     State(state): State<Arc<AppState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-    Form(form): Form<PostForm>
-) -> Result<Html<String>, (StatusCode, Html<String>)> {
-    let session = state.session.lock().await;
-    let is_authenticated = session.get::<bool>("is_authenticated").unwrap_or(false);
+    Form(form): Form<PostForm>,
+    session: Session
+) -> Result<Html<String>, AppError> {
+    let is_authenticated: Option<bool> = session.get("is_authenticated").await.unwrap_or(None);
      
-    if is_authenticated {
-        println!("is_authenticated");
-        // User is authenticated, post to X
-        match post_to_x(&form.content, &session.get::<String>("access_token").unwrap_or_default()).await {
-            Ok(_) => {
-                println!("Successfully posted to X");
-                Ok(Html(format!("<h1>Successfully posted to X!</h1><p>This is what was posted: '{}'</p><a href='/'>Return to home</a>",&form.content)))
-            },
-            Err(e) => {
-                eprintln!("Error posting to X: {}", e);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Html(format!("<h1>Error posting to X</h1><p>{}</p><a href='/'>Return to home</a>", e))))
+    match is_authenticated {
+
+        Some(true) => {
+            println!("is_authenticated");
+            // User is authenticated, post to X
+            match post_to_x(&form.content, session).await {
+                Ok(_) => {
+                    Ok(Html("<h1>Posted to X</h1>".to_string()))
+                }
+                Err(e) => {
+                    Err(e)
+                }
             }
         }
-    } else {
-        // User is not authenticated, redirect to home
-        println!("User not authenticated");
-        Err((StatusCode::UNAUTHORIZED, Html("<h1>Unauthorized</h1><a href='/'>Return to home</a>".to_string())))
+        Some(false) => {
+            // User is not authenticated, redirect to home
+            println!("User not authenticated");
+            Ok(Html("<h1>Not authenticated</h1><p>You need to be authenticated to post</p>".to_string()))
+        }
+        None => {
+            // User is not authenticated, redirect to home
+            println!("User not authenticated.");
+            Ok(Html("<h1>Not authenticated.</h1><p>You need to be authenticated to post</p>".to_string()))
+        }
     }
 
 }
 
 
-async fn get_home(State(state): State<Arc<AppState>>) -> Result<Html<String>, StatusCode> {
-    let session = state.session.lock().await;
+async fn get_home(
+    State(state): State<Arc<AppState>>,
+    session: Session
+    ) -> Result<Html<String>, StatusCode> {
+
     let is_authenticated = session.get::<bool>("is_authenticated").unwrap_or(false);
     let username = session.get::<String>("username").unwrap_or("unknown user".to_string());
 
