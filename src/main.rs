@@ -64,43 +64,6 @@ struct AppState {
     pkce_verifier: Mutex<Option<PkceCodeVerifier>>,
 }
 
-impl AppState {
-    pub async fn refresh_access_token(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let access_token = session.get::<String>("access_token").unwrap_or_default();
-        let refresh_token = session.get::<String>("refresh_token").unwrap_or_default();
-        let expiration_time = session.get::<SystemTime>("access_token_expiration_time").unwrap_or(SystemTime::UNIX_EPOCH);
-
-        let url = "https://api.twitter.com/2/oauth2/token";
-    
-        let client = Client::new();
-
-        let basic_auth_str = format!("{}:{}", self.config.values.get("X_CLIENT_ID").expect("Couldn't retrieve X_CLIENT_ID when refreshing token").to_string(), self.config.values.get("X_CLIENT_SECRET").expect("Couldn't retrieve X_CLIENT_SECRET when refreshing token").to_string());
-        let basic_auth_encoded = encode(basic_auth_str);
-
-        let response = client.post(url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("Authorization", format!("Basic {}", basic_auth_encoded))
-            .form(&[
-                ("refresh_token", refresh_token),
-                ("grant_type", "refresh_token".to_string()),
-            ])
-            .send()
-            .await?;
-
-        let new_tokens: StandardTokenResponse<EmptyExtraTokenFields, BasicTokenType> = response.json().await?;
-
-        let new_access_token = new_tokens.access_token().secret();
-        let new_refresh_token = new_tokens.refresh_token().unwrap().secret();
-        let new_expires_in = new_tokens.expires_in().unwrap();
-        let new_expiration_time = SystemTime::now() + Duration::from_secs(new_expires_in as u64);
-
-        session.insert("access_token", new_access_token).unwrap();
-        session.insert("refresh_token", new_refresh_token).unwrap();
-        session.insert("access_token_expiration_time", new_expiration_time).unwrap();
-        println!("Refreshed access token");
-        Ok(())
-    }
-}
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Config {
@@ -158,11 +121,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
-}
-
-async fn token_needs_refresh(session: Session) -> bool {
-    let current_time = SystemTime::now();
-    current_time < session.await.get::<SystemTime>("expiration_time").unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 
@@ -288,9 +246,9 @@ async fn logout(State(state): State<Arc<AppState>>, mut session: Session) -> imp
 async fn post_to_x(content: &str, session: Session) -> Result<(), AppError> {
     println!("Posting to X");
     let client = Client::new();
-    let access_token: Option<String> = session.get::<String>("access_token").await
+    let access_token: String = session.get("access_token").await
         .unwrap_or(None)
-        .unwrap_or_else(|| String::new());
+        .ok_or_else(|| AppError(anyhow::anyhow!("access_token not found")))?;
     let response = client
         .post("https://api.twitter.com/2/tweets")
         .header("Authorization", format!("Bearer {}", access_token))
@@ -317,37 +275,30 @@ struct PostForm {
 }
 
 async fn post_home(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
     Form(form): Form<PostForm>,
     session: Session
 ) -> Result<Html<String>, AppError> {
-    let is_authenticated: Option<bool> = session.get("is_authenticated").await.unwrap_or(None);
+    // get the auth status or if there is nothing is_authenticated should default to false
+    let is_authenticated: Option<bool> = session.get("is_authenticated").await
+        .unwrap_or(None);
      
-    match is_authenticated {
+    if let Some(true) = is_authenticated {
 
-        Some(true) => {
-            println!("is_authenticated");
-            // User is authenticated, post to X
-            match post_to_x(&form.content, session).await {
-                Ok(_) => {
-                    Ok(Html("<h1>Posted to X</h1>".to_string()))
-                }
-                Err(e) => {
-                    Err(e)
-                }
+        println!("is_authenticated");
+        // User is authenticated, post to X
+        match post_to_x(&form.content, session).await {
+            Ok(_) => {
+                Ok(Html("<h1>Posted to X</h1>".to_string()))
+            }
+            Err(e) => {
+                println!("Failed to post to X: {:?}", e);
+                Ok(Html("<h1>Failed to post to X</h1>".to_string()))
             }
         }
-        Some(false) => {
-            // User is not authenticated, redirect to home
-            println!("User not authenticated");
-            Ok(Html("<h1>Not authenticated</h1><p>You need to be authenticated to post</p>".to_string()))
-        }
-        None => {
-            // User is not authenticated, redirect to home
-            println!("User not authenticated.");
-            Ok(Html("<h1>Not authenticated.</h1><p>You need to be authenticated to post</p>".to_string()))
-        }
+    } else {
+        // User is not authenticated, redirect to home
+        println!("User not authenticated");
+        Ok(Html("<h1>Not authenticated</h1><p>You need to be authenticated to post</p>".to_string()))
     }
 
 }
@@ -356,10 +307,14 @@ async fn post_home(
 async fn get_home(
     State(state): State<Arc<AppState>>,
     session: Session
-    ) -> Result<Html<String>, StatusCode> {
+    ) -> Result<Html<String>, AppError> {
 
-    let is_authenticated = session.get::<bool>("is_authenticated").unwrap_or(false);
-    let username = session.get::<String>("username").unwrap_or("unknown user".to_string());
+    let is_authenticated = session.get("is_authenticated").await
+        .unwrap_or(None)
+        .ok_or_else(|| AppError(anyhow::anyhow!("is_authenticated not found in session")))?;
+    let username: String = session.get("username").await
+        .unwrap_or(None)
+        .ok_or_else(|| AppError(anyhow::anyhow!("username not found in session")))?;
 
     let body = if is_authenticated {
         println!("Authenticated user {}", &username);
